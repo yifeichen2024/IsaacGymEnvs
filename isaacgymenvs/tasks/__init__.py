@@ -53,6 +53,8 @@ from .allegro_kuka.allegro_kuka_throw import AllegroKukaThrow
 from .allegro_kuka.allegro_kuka_two_arms_regrasping import AllegroKukaTwoArmsRegrasping
 from .allegro_kuka.allegro_kuka_two_arms_reorientation import AllegroKukaTwoArmsReorientation
 
+from .allegro_hand_down import AllegroHandDown
+
 from .industreal.industreal_task_pegs_insert import IndustRealTaskPegsInsert
 from .industreal.industreal_task_gears_insert import IndustRealTaskGearsInsert
 
@@ -86,6 +88,7 @@ def resolve_allegro_kuka_two_arms(cfg, *args, **kwargs):
 
 # Mappings from strings to environments
 isaacgym_task_map = {
+    "AllegroHandDown": AllegroHandDown,
     "AllegroHand": AllegroHand,
     "AllegroKuka": resolve_allegro_kuka,
     "AllegroKukaTwoArms": resolve_allegro_kuka_two_arms,

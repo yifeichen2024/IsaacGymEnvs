@@ -1,20 +1,22 @@
 <?xml version="1.0"?>
-<robot name="object">
-  <link name="object">
+<robot name="box">
+  <link name="box">
     <visual>
       <origin xyz="0 0 0"/>
       <geometry>
-        <mesh filename="meshes/cube_multicolor.obj" scale=".025 .025 .025"/>
+        <box size="0.12 0.12 0.5"/>
       </geometry>
     </visual>
     <collision>
       <origin xyz="0 0 0"/>
       <geometry>
-        <box size="0.025 0.025 0.025"/>
+        <box size="0.12 0.12 0.5"/>
       </geometry>
     </collision>
     <inertial>
-      <density value="567.0"/>
+      <mass value="500"/>
+      <friction value="1.0"/>
+      <inertia ixx="1000.0" ixy="0.0" ixz="0.0" iyy="1000.0" iyz="0.0" izz="1000.0"/>
     </inertial>
   </link>
 </robot>
