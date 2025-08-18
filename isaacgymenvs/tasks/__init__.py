@@ -54,7 +54,7 @@ from .allegro_kuka.allegro_kuka_two_arms_regrasping import AllegroKukaTwoArmsReg
 from .allegro_kuka.allegro_kuka_two_arms_reorientation import AllegroKukaTwoArmsReorientation
 
 from .allegro_hand_down import AllegroHandDown
-
+from .shadow_hand_down import ShadowHandDown
 from .industreal.industreal_task_pegs_insert import IndustRealTaskPegsInsert
 from .industreal.industreal_task_gears_insert import IndustRealTaskGearsInsert
 
@@ -113,5 +113,6 @@ isaacgym_task_map = {
     "Ingenuity": Ingenuity,
     "Quadcopter": Quadcopter,
     "ShadowHand": ShadowHand,
+    "ShadowHandDown": ShadowHandDown,
     "Trifinger": Trifinger,
 }

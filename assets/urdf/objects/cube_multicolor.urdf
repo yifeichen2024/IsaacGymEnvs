@@ -4,13 +4,13 @@
     <visual>
       <origin xyz="0 0 0"/>
       <geometry>
-        <mesh filename="meshes/cube_multicolor.obj" scale=".025 .025 .025"/>
+        <mesh filename="meshes/cube_multicolor.obj" scale=".055 .055 .055"/>
       </geometry>
     </visual>
     <collision>
       <origin xyz="0 0 0"/>
       <geometry>
-        <box size="0.025 0.025 0.025"/>
+        <box size="0.055 0.055 0.055"/>
       </geometry>
     </collision>
     <inertial>

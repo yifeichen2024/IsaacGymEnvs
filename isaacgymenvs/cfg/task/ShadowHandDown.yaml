@@ -1,5 +1,5 @@
 # used to create the object
-name: AllegroHandDown
+name: ShadowHandDown
 
 physics_engine: ${..physics_engine}
 
@@ -20,7 +20,7 @@ env:
   useRelativeControl: True # False
   dofSpeedScale: 20.0
   actionsMovingAverage: 1.0
-  controlFrequencyInv: 2 # 30 Hz
+  controlFrequencyInv: 1 # 60 Hz
 
   startPositionNoise: 0.01
   startRotationNoise: 0.0
@@ -29,9 +29,6 @@ env:
   resetRotationNoise: 0.0
   resetDofPosRandomInterval: 0.2
   resetDofVelRandomInterval: 0.0
-
-  startObjectPoseDY: -0.19
-  startObjectPoseDZ: 0.06
 
   # Random forces applied to the object
   forceScale: 0.0
@@ -50,37 +47,30 @@ env:
 
   objectType: "block" # can be block, egg or pen
   # cylinder, cylinder_corner, cylinder_axis, block
-  observationType: "full_state" # can be "no_vel", "full_state"
+  observationType: "full_state" # can be "openai", "full_no_vel", "full", "full_state"
   asymmetric_observations: False
   successTolerance: 0.1
   printNumSuccesses: False
   maxConsecutiveSuccesses: 0
-
-  # for rotation axis
+   # 自转轴
   axisK: [0, 0, 1]
   useThetaGoal: False
   thetaGoalDeg: 180
   deltaThetaTolDeg: 10
   deltaXYTol: 0.02
   pushAwayThresh: 0.07
-  zMin: 0.5
+  zMin: 0.40
   successHoldSteps: 15
   tableForceThr: 5.0
-  defaultDofPos: [
-            -0.0771, 0.6144, 0.6420, 0.6009,
-            0.0,    0.6885, 0.6990, 0.5725,
-            0.0,    0.8274, 0.6709, 0.3643,
-            1.2536, 0.5940,-0.1373, 0.5759
-            ]
 
   w:
     rot: 80.0
     err: 0.5 # 1.5
     succ: 2.0
     dist: 0.0
-    push: 3.0
+    push: 10.0
     table: 0.0
-    fall: 10.0
+    fall: 30.0
     work:  1.0e-3
     torque:  1.0e-4
     pen: 0.0 # 0.5
@@ -92,11 +82,11 @@ env:
     clipEnergyReward: 1
     energyUpperBound: 30.0
     penalizeTbContact: 1 # 1
-    tbContactScale: 2.0 # 0.5
-    tbContactThr: 0.0
+    tbContactScale: 1.0
+    tbContactThr: 0.1
 
   asset:
-    assetFileName: "urdf/kuka_allegro_description/allegro_touch_sensor.urdf"
+    assetFileName: "mjcf/open_ai_assets/hand/shadow_hand.xml"
     assetFileNameBlock: "urdf/objects/cube_multicolor.urdf"
     assetFileNameCylinder: "urdf/objects/cylinder.urdf"
     assetFileNameCylinderCorner: "urdf/objects/cylinder_corner.urdf"
@@ -108,12 +98,12 @@ env:
   enableCameraSensors: False
 
 task:
-  randomize: True # False
+  randomize: True
   randomization_params:
     frequency: 720   # Define how many simulation steps between generating new randomizations
     observations:
       range: [0, .002] # range for the white noise
-      range_correlated: [0, .001 ] # range for correlated noise, refreshed with freq `frequency`
+      range_correlated: [0, .001] # range for correlated noise, refreshed with freq `frequency`
       operation: "additive"
       distribution: "gaussian"
       # schedule: "linear"   # "constant" is to turn on noise after `schedule_steps` num steps
@@ -125,7 +115,7 @@ task:
       distribution: "gaussian"
       # schedule: "linear"  # "linear" will linearly interpolate between no rand and max rand
       # schedule_steps: 40000
-    sim_params:
+    sim_params: 
       gravity:
         range: [0, 0.4]
         operation: "additive"
@@ -135,6 +125,19 @@ task:
     actor_params:
       hand:
         color: True
+        tendon_properties:
+          damping:
+            range: [0.3, 3.0]
+            operation: "scaling"
+            distribution: "loguniform"
+            # schedule: "linear"  # "linear" will scale the current random sample by `min(current num steps, schedule_steps) / schedule_steps`
+            # schedule_steps: 30000
+          stiffness:
+            range: [0.75, 1.5]
+            operation: "scaling"
+            distribution: "loguniform"
+            # schedule: "linear"  # "linear" will scale the current random sample by `min(current num steps, schedule_steps) / schedule_steps`
+            # schedule_steps: 30000
         dof_properties:
           damping: 
             range: [0.3, 3.0]
@@ -142,7 +145,7 @@ task:
             distribution: "loguniform"
             # schedule: "linear"  # "linear" will scale the current random sample by `min(current num steps, schedule_steps) / schedule_steps`
             # schedule_steps: 30000
-          stiffness:
+          stiffness: 
             range: [0.75, 1.5]
             operation: "scaling"
             distribution: "loguniform"
@@ -161,7 +164,7 @@ task:
             # schedule: "linear"  # "linear" will scale the current random sample by `min(current num steps, schedule_steps) / schedule_steps`
             # schedule_steps: 30000
         rigid_body_properties:
-          mass:
+          mass: 
             range: [0.5, 1.5]
             operation: "scaling"
             distribution: "uniform"
@@ -169,7 +172,7 @@ task:
             # schedule: "linear"  # "linear" will scale the current random sample by `min(current num steps, schedule_steps) / schedule_steps`
             # schedule_steps: 30000
         rigid_shape_properties:
-          friction:
+          friction: 
             num_buckets: 250
             range: [0.7, 1.3]
             operation: "scaling"
@@ -185,7 +188,7 @@ task:
           # schedule: "linear"  # "linear" will scale the current random sample by ``min(current num steps, schedule_steps) / schedule_steps`
           # schedule_steps: 30000
         rigid_body_properties:
-          mass:
+          mass: 
             range: [0.5, 1.5]
             operation: "scaling"
             distribution: "uniform"
@@ -217,7 +220,7 @@ sim:
     num_subscenes: ${....num_subscenes}
     contact_offset: 0.002
     rest_offset: 0.0
-    bounce_threshold_velocity: 0.2
+    bounce_threshold_velocity: 0.2 
     max_depenetration_velocity: 1000.0
     default_buffer_size_multiplier: 5.0
     contact_collection: 1 # 0: CC_NEVER (don't collect contact info), 1: CC_LAST_SUBSTEP (collect only contacts on last substep), 2: CC_ALL_SUBSTEPS (broken - do not use!)

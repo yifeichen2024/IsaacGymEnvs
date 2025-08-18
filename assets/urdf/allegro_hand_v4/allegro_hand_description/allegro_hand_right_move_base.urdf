@@ -50,8 +50,8 @@
       <origin xyz="0 0 0"/>
       <axis xyz="1 0 0"/>
       <!-- 小行程限制，自己按需要调，别太大 -->
-      <limit effort="50" lower="-0.03" upper="0.03" velocity="0.5"/>
-      <dynamics damping="5.0" friction="0.1"/>
+      <limit effort="0.5" lower="-0.01" upper="0.01" velocity="0.5"/>
+      <dynamics stiffness="500" damping="5.0" friction="0.1"/>
     </joint>
   
     <link name="base_y">
@@ -66,8 +66,8 @@
       <child link="base_y"/>
       <origin xyz="0 0 0"/>
       <axis xyz="0 1 0"/>
-      <limit effort="50" lower="-0.03" upper="0.03" velocity="0.5"/>
-      <dynamics damping="5.0" friction="0.1"/>
+      <limit effort="0.5" lower="-0.01" upper="0.01" velocity="0.5"/>
+      <dynamics stiffness="500" damping="5.0" friction="0.1"/>
     </joint>
   
     <link name="base_z">
@@ -82,8 +82,8 @@
       <child link="base_z"/>
       <origin xyz="0 0 0"/>
       <axis xyz="0 0 1"/>
-      <limit effort="50" lower="-0.03" upper="0.03" velocity="0.5"/>
-      <dynamics damping="5.0" friction="0.1"/>
+      <limit effort="0.5" lower="-0.01" upper="0.01" velocity="0.5"/>
+      <dynamics stiffness="500" damping="5.0" friction="0.1"/>
     </joint>
   
     <!-- 用 fixed 接回原本的 palm_link，并保留原来的 0.095 偏移 -->
