@@ -37,6 +37,7 @@ from isaacgymenvs.utils.torch_jit_utils import scale, unscale, quat_mul, quat_co
     to_torch, get_axis_params, torch_rand_float, tensor_clamp, quat_apply  
 from isaacgymenvs.tasks.base.vec_task import VecTask
 
+from typing import Tuple  # 放在文件顶端
 
 class AllegroHandDown(VecTask):
 
@@ -202,6 +203,31 @@ class AllegroHandDown(VecTask):
         self.penalize_tb_contact  = int(R.get("penalizeTbContact", 1))      # 0/1
         self.tb_cf_scale          = float(R.get("tbContactScale", 0.5))     # >0 生效
         self.tb_cf_thr            = float(R.get("tbContactThr", 0.2))   
+
+        # Force closure reward 
+        self.w_fc            = float(R.get("fcWeight",        1.0))   # dense: -||Gc||^2
+        self.w_fc_rank       = float(R.get("fcRankWeight",    0.2))   # dense: -lambda_minus(GG^T - eps I)
+        self.fc_eps          = float(R.get("fcEps",           1e-4))   # eps in λ_-(·)
+        self.fc_dist_thr     = float(R.get("fcContactDist",   0.01))  # tip->object当作接触的距离阈
+        self.fc_force_thr    = float(R.get("fcContactForce",   0.03))
+        self.fc_min_contacts = int(  R.get("fcMinContacts",   3))     # 至少几触点才算
+        self.fc_sparse_thr   = float(R.get("fcSparseThr",     0.02))  # 触发bonus的||Gc||^2阈
+        self.fc_sparse_bonus = float(R.get("fcSparseBonus",   2.0))   # 稀疏奖励幅度
+        self.fc_use_com_norm = int(  R.get("fcUseCOMNormal",  1))     # 1: 以 COM->xi 当表面法线近似
+        self.contact_hold_scale = float(R.get("contactHoldScale", 0.2))
+
+        # === FC 量级统一 ===
+        self.fc_normalize   = int(R.get("fcNormalize", 1))        # 规范化 Gc 尺度（与半径/触点数无关）
+        self.fc_autoscale   = int(R.get("fcAutoScale", 1))        # 运行中自适应把量级对齐到目标
+        self.fc_target_mag  = float(R.get("fcTargetMag", 0.08))   # 目标步级幅值（和 r_rot 同数量级）
+        self.fc_ema_beta    = float(R.get("fcEmaBeta", 0.98))     # EMA
+        self.fc_max_abs     = float(R.get("fcMaxAbs", 0.25))      # （可选）最终轻剪裁
+        self._fc_mag_ema    = torch.zeros((), device=self.device) # 运行统计
+
+        # === Debug: 分布打印 ===
+        self.debug_dist = int(R.get("debugDistributions", 1))
+        self.debug_every = int(R.get("debugEvery", 1000))  # 每多少个 compute_reward 打印一次
+        self._dbg_step = 0
 
         if self.penalize_tb_contact:
             _net_cf = self.gym.acquire_net_contact_force_tensor(self.sim)
@@ -586,18 +612,7 @@ class AllegroHandDown(VecTask):
                 (self.gym.find_actor_dof_handle(env_ptr, allegro_hand_actor, name),
                 self.hand_qpos_init_override[name]) for name in self.hand_qpos_init_override
             ]
-
-            # # —— 用名字找到四个 tip（当前 env 的 hand）并上红色（可视+碰撞）——
-            # name_handles_this_env = []
-            # self.fingertip_names = ["link_3_tip", "link_7_tip", "link_11_tip", "link_15_tip"]
-            # for nm in self.fingertip_names:
-            #     h_tip = self.gym.find_actor_rigid_body_handle(env_ptr, allegro_hand_actor, nm)
-            #     assert h_tip >= 0, f"Tip body not found by name in this env: {nm}"
-            #     name_handles_this_env.append(h_tip)
-            #     for mesh_type in (gymapi.MESH_VISUAL, gymapi.MESH_COLLISION):
-            #         self.gym.set_rigid_body_color(
-            #             env_ptr, allegro_hand_actor, h_tip, mesh_type, gymapi.Vec3(0.95, 0.2, 0.2)
-            #         )           
+       
             self.fingertip_actor_indices = [21, 16, 11, 6]  # [24, 19, 14, 9]  # [21, 16, 11, 6] #  
             # --- 给 4 个 tip 上红色，方便在 viewer 里确认 ---
             for b in self.fingertip_actor_indices:
@@ -682,14 +697,33 @@ class AllegroHandDown(VecTask):
         for env, hand in zip(self.envs, self.allegro_hands):
             self.gym.set_actor_dof_states(env, hand, init_states, gymapi.STATE_ALL)
     
-    def _print_actor_body_map(self, asset, actor, env_ptr, env_offset, tag):
-        n = self.gym.get_asset_rigid_body_count(asset)
-        print(f"\n[{tag}] asset_rb_count={n}, env_offset={env_offset}")
-        for j in range(n):
-            nm = self.gym.get_asset_rigid_body_name(asset, j)
-            h  = self.gym.find_actor_rigid_body_handle(env_ptr, actor, nm)  # actor 内索引
-            print(f"  asset[{j:02d}] {nm:<16} -> actor[{h:02d}] -> env[{env_offset + h:02d}]")
-            
+    def _self_check_tip_mapping(self):
+        # 1) 形状/范围
+        assert hasattr(self, "tip_env_ids_tensor")
+        assert self.tip_env_ids_tensor.dtype == torch.long and self.tip_env_ids_tensor.numel() == 4
+        assert (self.tip_env_ids_tensor >= 0).all() and (self.tip_env_ids_tensor < self.num_bodies).all()
+
+        # 2) 全 env：用“表里一致”的方式重建 env 级索引，再与 tip_env_ids_tensor 对比位置
+        env_offset = self._table_rb_count
+        name_actor_ids = list(self.fingertip_actor_indices)  # 例如 [21,16,11,6]
+        name_env_ids = to_torch([env_offset + a for a in name_actor_ids],
+                                dtype=torch.long, device=self.device)
+
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+        pos_by_name   = self.rigid_body_states[:, name_env_ids, :3]         # [N,4,3]
+        pos_by_tensor = self.rigid_body_states[:, self.tip_env_ids_tensor, :3]
+        dpos_max = torch.norm(pos_by_name - pos_by_tensor, dim=-1).max().item()
+        print(f"[TIP MAP] max |Δp| across all envs = {dpos_max:.6e} m")
+        assert dpos_max < 1e-6, "tip_env_ids_tensor 与按 actor->env 的映射不一致"
+
+        # 3) 再用接触力张量交叉验证（应该也完全一致）
+        self.gym.refresh_net_contact_force_tensor(self.sim)
+        f_by_name   = self.net_contact_forces[:, name_env_ids, :]
+        f_by_tensor = self.net_contact_forces[:, self.tip_env_ids_tensor, :]
+        df_max = (f_by_name - f_by_tensor).abs().max().item()
+        print(f"[TIP MAP] max |ΔF| across all envs = {df_max:.6e} N")
+        assert df_max < 1e-6, "force 视图不一致（索引错位）"
+
     def compute_reward(self, actions):
         # 刷新接触力张量（每步都要）
         self.gym.refresh_net_contact_force_tensor(self.sim)
@@ -729,10 +763,126 @@ class AllegroHandDown(VecTask):
             tau = torch.zeros_like(qdot)
             has_tau = 0
 
+        # 计算 tip 到物体中心距离，判定“接触/近接触”
+        to_com = tips_pos - self.object_pos[:,None,:]                  # [N,4,3]
+        dist   = torch.norm(to_com, p=2, dim=-1)                       # [N,4]
+        # contact_mask = (dist < self.fc_dist_thr)                       # [N,4]
+        
+        tip_forces = self.net_contact_forces[:, self.tip_env_ids_tensor, :]          # 先确保 tip_env_ids_tensor 正确
+        tip_fmag   = torch.norm(tip_forces, dim=-1)   
+        contact_mask = tip_fmag > self.fc_force_thr
+
+        # 若接触数不足，用最近的K个补足（保证梯度与密度）
+        K = tips_pos.shape[1]
+        kmin = self.fc_min_contacts
+        # 选出每个 env 最小的 kmin 个
+        vals, inds = torch.topk(dist, k=min(kmin, K), dim=1, largest=False)
+        # 聚合 mask
+        base_mask = torch.zeros_like(contact_mask)
+        base_mask.scatter_(1, inds, torch.ones_like(vals, dtype=torch.bool))
+
+        use_mask = contact_mask | base_mask                            # [N,4]
+        # 组装 x: 用 mask 取子集（为了保持 batch 维度，简单做法是把未选的点用 NaN 屏蔽，再压缩）
+        # 这里直接取全部4个点，但对未选用的点做权重0
+        w = use_mask.float().unsqueeze(-1)                             # [N,4,1]
+        x_all = tips_pos                                               # [N,4,3]
+
+        # 法线：默认用 COM->xi 归一化（近似物体表面法线，适于凸体）
+        if self.fc_use_com_norm == 1:
+            c_all = torch.nn.functional.normalize(-to_com, dim=-1)     # 指向物体外法线（xi->COM 为负，取反指向外）
+        else:
+            # 可替换为：用碰撞法线或估计的表面法线（若你有 SDF/三角网格法线）
+            c_all = torch.nn.functional.normalize(-to_com, dim=-1)
+
+        # 仅对选中的触点计入：用权重 w 做“软选择”
+        x_sel = x_all * w
+        c_sel = c_all * w
+
+        # 若总有效触点 < kmin，则给个强惩罚（避免两指晃动）
+        valid_counts = use_mask.float().sum(dim=1)                    # [N]
+        insufficient = (valid_counts < float(kmin)).float()           # [N]
+
+        gc2, lam_neg = fc_terms_batch(x_sel, c_sel, float(self.fc_eps))   # [N], [N]
+
+        # --- 尺度规范化：按选中触点有效半径 & 数量缩放到“可比”量级 ---
+        if self.fc_normalize == 1:
+            # 选中触点的平均平方半径 r2_mean（单位 m^2）
+            use_w = use_mask.float()                                      # [N,4]
+            r2 = (to_com**2).sum(dim=-1)                                  # [N,4]
+            # 只统计被选择的
+            r2_mean = (r2 * use_w).sum(dim=1) / (1e-6 + use_w.sum(dim=1)) # [N]
+            k_eff   = use_w.sum(dim=1).clamp(min=1.0)                     # [N]
+            denom   = k_eff * (1.0 + r2_mean)                             # [N] ~ 尺度项
+            gc2_n   = gc2 / denom
+            lam_n   = lam_neg / denom
+        else:
+            gc2_n, lam_n = gc2, lam_neg
+
+        # --- 基础惩罚（未缩放）---
+        r_fc_dense_raw = - self.w_fc * gc2_n - self.w_fc_rank * lam_n   # [N]
+
+        # --- 自适应缩放：把 |r_fc_dense| 的 EMA 调到目标幅值（不改变正负号/相对次序）---
+        if self.fc_autoscale == 1:
+            with torch.no_grad():
+                cur_mag = r_fc_dense_raw.abs().mean()
+                self._fc_mag_ema = self.fc_ema_beta * self._fc_mag_ema + (1.0 - self.fc_ema_beta) * cur_mag
+                scale_fc = (self.fc_target_mag / (1e-6 + self._fc_mag_ema)).clamp(0.1, 10.0)
+            r_fc_dense = scale_fc * r_fc_dense_raw
+            # 可视化
+            self.extras["fc_scale"]   = scale_fc
+            self.extras["fc_mag_ema"] = self._fc_mag_ema
+        else:
+            r_fc_dense = r_fc_dense_raw
+
+        # --- 稀疏 bonus & 触点不足（数值温和一些）---
+        stable_mask = (gc2_n < self.fc_sparse_thr) & (self.object_pos[:, 2] > self.z_min)
+        true_contact_counts = contact_mask.sum(dim=1)            # [N]
+        enough_true_contacts = (true_contact_counts >= self.fc_min_contacts)
+        stable_mask = stable_mask & enough_true_contacts
+        r_fc_sparse = (0.5 * self.fc_sparse_bonus) * stable_mask.float()   # 稍降温
+
+        r_fc_insuf = -0.1 * (valid_counts < float(kmin)).float()
+
+        # --- 合成 & 轻剪裁（防爆）---
+        r_fc = r_fc_dense + r_fc_sparse + r_fc_insuf
+        if self.fc_max_abs > 0:
+            r_fc = torch.clamp(r_fc, -self.fc_max_abs, self.fc_max_abs)
+        # 接触计数
+        contact_ok = enough_true_contacts.float()                   # [N]
+        # 轻奖励：只要满足 kmin 真接触就给
+        r_contact_hold = self.contact_hold_scale * contact_ok
+
+        # ---- 分布打印（距离/指尖力）----
+        if self.debug_dist:
+            self._dbg_step += 1
+            # 展平后分位数
+            with torch.no_grad():
+                flat_d = dist.reshape(-1)
+                flat_f = tip_fmag.reshape(-1)
+                qd = torch.quantile(flat_d, torch.tensor([0.5, 0.9, 0.99], device=self.device))
+                qf = torch.quantile(flat_f, torch.tensor([0.5, 0.9, 0.99], device=self.device))
+                # 记录到 TB
+                self.extras["dist_p50"] = qd[0]
+                self.extras["dist_p90"] = qd[1]
+                self.extras["dist_p99"] = qd[2]
+                self.extras["fmag_p50"] = qf[0]
+                self.extras["fmag_p90"] = qf[1]
+                self.extras["fmag_p99"] = qf[2]
+
+                self.fc_dist_thr = (qd[1] + qd[2]) / 2
+
+                # 周期性打印（用于人工挑阈值）
+                if (self._dbg_step % self.debug_every) == 0:
+                    print(f"[DIST] p50={qd[0]:.4f}  p90={qd[1]:.4f}  p99={qd[2]:.4f} (m)")
+                    print(f"[FMAG] p50={qf[0]:.4f}  p90={qf[1]:.4f}  p99={qf[2]:.4f} (N)")
+                    # 经验建议（仅文本提示，不会改配置）：
+                    # 距离阈值：取 p70~p80 之间（可先用 p80≈(qd[1]+qd[2])/2）
+                    # 力阈值：取 p60~p70 之间（可先用 0.5*(qf[0]+qf[1])）
+                    
         # —— 用 JIT 奖励计算 —— 
         (rew, resets_base, theta_out, succ_hold_out,
          theta_step, dev_angle, r_rot, r_push, r_table, r_fall,
-         r_ftip, r_energy, r_tb) = compute_spin_reward_axis_jit(
+         r_ftip, r_energy, r_tb, r_knear) = compute_spin_reward_axis_jit(
             self.object_pos, self.object_rot, self.last_object_rot,
             self.k_world, self.v1_basis, self.v2_basis,
             tips_pos, tip_count,
@@ -754,6 +904,7 @@ class AllegroHandDown(VecTask):
             tb_strength=self.table_contact_force if self.penalize_tb_contact else None, # tb_strength, # float(table_cf),                         # [N,3]
             tb_cf_thr=float(self.tb_cf_thr),
             tb_cf_scale=float(self.tb_cf_scale),
+            near_thr=float(self.fc_dist_thr),
         )
 
         # 超时并入 reset
@@ -761,7 +912,7 @@ class AllegroHandDown(VecTask):
         resets = torch.where(timed_out, torch.ones_like(resets_base), resets_base)
 
         # 写回 buffer
-        self.rew_buf[:]   = rew
+        self.rew_buf[:]   = rew + r_fc + r_contact_hold
         self.reset_buf[:] = resets.float()
 
         # 维护状态
@@ -781,6 +932,24 @@ class AllegroHandDown(VecTask):
         self.extras["r_ftip"]   = r_ftip.mean()
         self.extras["r_energy"] = r_energy.mean()
         self.extras["r_tb"]     = r_tb.mean()
+        self.extras["r_knear"]  = r_knear.mean()
+        
+        # 统计（可保留你原有的）
+        self.extras["fc_gc2"]       = gc2_n.mean() if self.fc_normalize else gc2.mean()
+        self.extras["fc_lamneg"]    = lam_n.mean() if self.fc_normalize else lam_neg.mean()
+        self.extras["r_fc_dense"]   = r_fc_dense.mean()
+        self.extras["r_fc_bonus"]   = r_fc_sparse.mean()
+        self.extras["r_contact_hold"] = (self.contact_hold_scale * enough_true_contacts.float()).mean()
+
+        # 接触相关
+        self.extras["tip_fmag_mean"]   = tip_fmag.mean()
+        self.extras["tip_fmag_max"]    = tip_fmag.max()
+        self.extras["true_contact_cnt"] = contact_mask.sum(dim=1).float().mean()
+        self.extras["use_mask_cnt"]     = use_mask.sum(dim=1).float().mean()
+
+        # 物体状态
+        self.extras["obj_z_mean"]   = self.object_pos[:,2].mean()
+        self.extras["fn_est_z_mean"] = fn_est_z.mean()  # 估计桌面法向力
         # self.extras["tb_strength"] = tb_strength.mean()
         # self.extras["tb_contact_rate"] = in_contact.float().mean()
     
@@ -1087,7 +1256,7 @@ class AllegroHandDown(VecTask):
     def post_physics_step(self):
         if getattr(self, "_need_verify_once", False):
             self.gym.refresh_rigid_body_state_tensor(self.sim)
-
+            
             i = 0  # 只看第0个环境
             env_offset = self._table_rb_count
             
@@ -1098,7 +1267,7 @@ class AllegroHandDown(VecTask):
             # 你那组“人工验证”的 actor/env 索引
             dbg_actor_ids = self.fingertip_actor_indices
             dbg_env_ids   = [env_offset + a for a in dbg_actor_ids] if dbg_actor_ids else []
-
+            
             if dbg_env_ids:
                 for k, nm in enumerate(self.fingertip_names):
                     # 为了可比，按 k 取（假设顺序对应）。若顺序不对应，你可以在 cfg 里按相同顺序填写 debug 索引
@@ -1111,7 +1280,6 @@ class AllegroHandDown(VecTask):
                     p_dbg  = self.rigid_body_states[i, e_dbg,  0:3]
                     d = torch.norm(p_name - p_dbg).item()
                     print(f"[VERIFY Δp] {nm:<12} name_actor={a_name:02d} dbg_actor={a_dbg:02d} |Δp|={d:.6f} m")
-                    print(f"[DEBUG] Rotation weights={self.w_rot}, table weights={self.penalize_tb_contact}, {self.tb_cf_scale}")
                     # print(f"[DEBUG] Net Contact force {self.net_contact_force}")
                     # print(f"[DEBUG] Table contact force: {self.table_contact_force}")
                     # 在 viewer 里画十字：name(红)、dbg(蓝)
@@ -1128,6 +1296,9 @@ class AllegroHandDown(VecTask):
 
             self._need_verify_once = False
 
+            if not hasattr(self, "_did_tip_check"):
+                self._self_check_tip_mapping()
+                self._did_tip_check = True
         # print(f"[DEBUG] Net Contact force {self.net_contact_force}")
         # print(f"[DEBUG] Table contact force: {self.table_contact_force}")
         self.progress_buf += 1
@@ -1197,6 +1368,7 @@ def compute_spin_reward_axis_jit(
     # tb_strength: torch.Tensor,             # [N,3] 桌面合力向量
     tb_cf_thr: float,
     tb_cf_scale: float,
+    near_thr: float,
 ):
     # 相对旋转推进
     q_rel = quat_mul(obj_rot, quat_conjugate(last_obj_rot))
@@ -1215,6 +1387,15 @@ def compute_spin_reward_axis_jit(
 
     r_rot = torch.clamp(theta_step, -c1_clip, c1_clip)
     r_dev = -dev_angle
+
+    # 计算每步“近接触”的指尖数
+    d_tip = torch.norm(tip_pos - obj_pos[:, None, :], dim=-1)       # [N, tip]
+    knear = (d_tip < near_thr).sum(dim=1)                           # [N]
+    in_air = (obj_pos[:, 2] > (z_min))
+    gate = ( (knear >= 3) & in_air ).float()                        # [N]
+    # r_rot 只在 gate=1 时吃满；否则打 0.3 折扣（仍可探索）
+    r_rot = r_rot * (0.3 + 0.7 * gate)
+    r_knear = 0.15 * (knear >= 3).float() + 0.15 * (knear >= 4).float()
 
     # 目标角/成功维持
     if use_theta_goal == 1:
@@ -1292,13 +1473,58 @@ def compute_spin_reward_axis_jit(
         w_torque * r_torque +
         w_pen    * r_pen    +
         w_dev    * r_dev    +
-        r_ftip + r_energy + r_tb
+        r_ftip + r_energy + r_tb + r_knear
     )
 
     resets_base = torch.max(resets_succ, (obj_pos[:,2] < z_min).float())
 
-    return rew, resets_base, theta_buf, succ_hold, theta_step, dev_angle, r_rot, r_push, r_table, r_fall, r_ftip, r_energy, r_tb #, r_dist,
+    return rew, resets_base, theta_buf, succ_hold, theta_step, dev_angle, r_rot, r_push, r_table, r_fall, r_ftip, r_energy, r_tb , r_knear #, r_dist,
 
+@torch.jit.script
+def _skew3(x: torch.Tensor) -> torch.Tensor:
+    # x: [B,3] -> [B,3,3]  (用于构造 x^ 叉乘矩阵)
+    B = x.shape[0]
+    z = torch.zeros((B,), dtype=x.dtype, device=x.device)
+    X = torch.stack([
+        torch.stack([ z,    -x[:,2],  x[:,1] ], dim=-1),
+        torch.stack([ x[:,2],   z,   -x[:,0] ], dim=-1),
+        torch.stack([-x[:,1], x[:,0],   z    ], dim=-1),
+    ], dim=1)
+    return X
+
+@torch.jit.script
+def fc_terms_batch(x: torch.Tensor, c: torch.Tensor, eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    x: [N,K,3]  接触点（世界系）
+    c: [N,K,3]  摩擦锥轴（这里用表面法线近似，单位向量）
+    返回：
+      gc2: [N]   ||G_c||^2
+      lam_neg: [N]  λ_-( G G^T - eps I_6 ) 的负部 (ReLU(-λ_min))，做为秩惩罚
+    """
+    N, K, _ = x.shape
+    # 组装 G: [N,6,3K]  = [I; x^] ⊕K
+    I = torch.eye(3, dtype=x.dtype, device=x.device).view(1,3,3).repeat(N,1,1)             # [N,3,3]
+    Xsk = _skew3(x.reshape(-1,3)).reshape(N,K,3,3)                                         # [N,K,3,3]
+    top = I.unsqueeze(2).repeat(1,1,K,1).reshape(N,3,3*K)                                   # [N,3,3K]
+    bot = Xsk.reshape(N,K,3,3).permute(0,2,1,3).reshape(N,3,3*K)                            # [N,3,3K]
+    G   = torch.cat([top, bot], dim=1)                                                      # [N,6,3K]
+
+    # G_c = sum_i [I; x_i^] c_i  → 等价于 G @ vec(c) （c 按 [c1;c2;...;cK] 堆叠）
+    cvec = c.reshape(N, 3*K)                                                                # [N,3K]
+    Gc   = torch.bmm(G, cvec.unsqueeze(-1)).squeeze(-1)                                     # [N,6]
+    gc2  = (Gc*Gc).sum(dim=-1)                                                              # [N]
+
+    # 秩项：λ_- (G G^T - eps I_6)
+    GGt = torch.bmm(G, G.transpose(1,2))                                                    # [N,6,6]
+    Id6 = torch.eye(6, dtype=x.dtype, device=x.device).view(1,6,6)
+    M   = GGt - eps * Id6                                                                   # [N,6,6]
+    # 最小特征值
+    # torch.linalg.eigvalsh 更稳：对称矩阵
+    eigs = torch.linalg.eigvalsh(M)                                                         # [N,6]
+    lam_min = eigs[:,0]
+    lam_neg = torch.relu(-lam_min)                                                          # 负部
+
+    return gc2, lam_neg
 
 @torch.jit.script
 def randomize_rotation(rand0, rand1, x_unit_tensor, y_unit_tensor):
