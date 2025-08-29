@@ -18,9 +18,9 @@ env:
   forceLimitScale: 1.0
 
   useRelativeControl: True # False
-  dofSpeedScale: 15 # 20.0
-  actionsMovingAverage: 0.7
-  controlFrequencyInv: 2 # 30 Hz
+  dofSpeedScale: 12 # 15 # 12 # 20.0
+  actionsMovingAverage: 0.85 # 0.85 # 0.7
+  controlFrequencyInv: 2 # 2 # 30 Hz
 
   startPositionNoise: 0.01
   startRotationNoise: 0.0
@@ -48,13 +48,15 @@ env:
   fallDistance: 0.24
   fallPenalty: 0.0
 
-  objectType: "block" # can be block, egg or pen
+  objectType: "cylinder" # can be block, egg or pen
   # cylinder, cylinder_corner, cylinder_axis, block
   observationType: "full_state" # can be "no_vel", "full_state"
   asymmetric_observations: False
   successTolerance: 0.1
   printNumSuccesses: False
   maxConsecutiveSuccesses: 0
+
+  palmBodyName: "palm_link"     # 手掌刚体名；找不到会回退到手的第一个刚体
 
   # for rotation axis
   axisK: [0, 0, 1]
@@ -74,7 +76,7 @@ env:
             ]
 
   w:
-    rot: 80.0
+    rot: 80 # 80.0
     err: 0.5 # 1.5
     succ: 2.0
     dist: 0.0
@@ -87,30 +89,33 @@ env:
     dev: 10.0
 
   reward:
-    ftipRewardScale: -2 # -0.5
+    ftipRewardScale: -1 # -2 # -0.5
     energyScale: 0.001
     clipEnergyReward: 1
     energyUpperBound: 30.0
     penalizeTbContact: 1 # 1
-    tbContactScale: 0.3 # 0.5
+    tbContactScale: 0.0 # 0.8 # 0.6
     tbContactThr: 0.0
 
+    posePenaltyScale: 0.6
+    palmZAlpha: 1.0          # 惩罚系数 α
+    palmZTol:   0.02         # 死区容许 |dz - dz0| ≤ 2 cm 不惩罚
+
     # Force-closure
-    fcWeight:        0.3
-    fcRankWeight:    0.05
+    fcWeight:        0.0 # 0.9 # 0.8 # 0.3
+    fcRankWeight:    0.0 # 0.08 # 0.05
     fcEps:           1.0e-4
-    fcContactDist:   0.10    # 0.01
+    fcContactDist:   0.08    # 0.01
     fcContactForce: 0.01
-    fcMinContacts:   3 # 2
-    fcSparseThr:     0.4 # 0.05    
-    fcSparseBonus:   1.2       # 降低，避免“碰一下就跑”
+    fcMinContacts:   4 # 3 # 2
+    fcSparseThr:     0.35 # 0.05    
+    fcSparseBonus:   0.0 # .0      
     fcUseCOMNormal:  1
     contactHoldScale: 0.4
-
   asset:
     assetFileName: "urdf/kuka_allegro_description/allegro_touch_sensor.urdf"
     assetFileNameBlock: "urdf/objects/cube_multicolor.urdf"
-    assetFileNameCylinder: "urdf/objects/cylinder.urdf"
+    assetFileNameCylinder: "urdf/objects/cylinder_0.urdf" # "urdf/objects/cylinder.urdf"
     assetFileNameCylinderCorner: "urdf/objects/cylinder_corner.urdf"
     assetFileNameCylinderAxis: "urdf/objects/cylinder_axis.urdf"
     assetFileNameEgg: "mjcf/open_ai_assets/hand/egg.xml"

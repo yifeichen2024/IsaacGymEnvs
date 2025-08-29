@@ -204,6 +204,11 @@ class AllegroHandDown(VecTask):
         self.tb_cf_scale          = float(R.get("tbContactScale", 0.5))     # >0 生效
         self.tb_cf_thr            = float(R.get("tbContactThr", 0.2))   
 
+        self.pose_penalty_scale = float(R.get("posePenaltyScale", 0.3))  # >0 生效
+        self.palm_z_alpha = float(R.get("palmZAlpha", 0.0))  # >0 生效
+        self.palm_z_tol   = float(R.get("palmZTol", 0.02))
+        self.palm_body_name = self.cfg["env"].get("palmBodyName", "palm_link")
+        
         # Force closure reward 
         self.w_fc            = float(R.get("fcWeight",        1.0))   # dense: -||Gc||^2
         self.w_fc_rank       = float(R.get("fcRankWeight",    0.2))   # dense: -lambda_minus(GG^T - eps I)
@@ -254,6 +259,8 @@ class AllegroHandDown(VecTask):
         self.obj_xy_ref      = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device)
         self.last_object_rot = torch.zeros(self.num_envs, 4, dtype=torch.float, device=self.device)
         self.succ_hold_count = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        self.palm_obj_dz0 = torch.zeros(self.num_envs, device=self.device)
 
         # 单步推进裁剪：c1 = 1.5*dt（再 cap 一下）
         self.c1 = min(1.5 * self.dt, 0.25)
@@ -398,24 +405,43 @@ class AllegroHandDown(VecTask):
         asset_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../assets')
         object_asset_file = self.asset_files_dict[self.object_type]
 
-                # initial joint 
+        # initial joint 
+        # self.hand_qpos_init_override = {
+        #     "joint_0": -0.0771,
+        #     "joint_1": 0.6144, 
+        #     "joint_2": 0.6420, 
+        #     "joint_3": 0.6009,
+        #     "joint_4": 0.0,
+        #     "joint_5": 0.6885,
+        #     "joint_6": 0.6990,
+        #     "joint_7": 0.5725,
+        #     "joint_8": 0.0,
+        #     "joint_9": 0.8274, 
+        #     "joint_10": 0.6709, 
+        #     "joint_11": 0.3643,
+        #     "joint_12": 1.2536,
+        #     "joint_13": 0.5940,
+        #     "joint_14": -0.1373,
+        #     "joint_15": 0.5759,
+        # }
+
         self.hand_qpos_init_override = {
-            "joint_0": -0.0771,
-            "joint_1": 0.6144, 
-            "joint_2": 0.6420, 
-            "joint_3": 0.6009,
-            "joint_4": 0.0,
-            "joint_5": 0.6885,
-            "joint_6": 0.6990,
-            "joint_7": 0.5725,
-            "joint_8": 0.0,
-            "joint_9": 0.8274, 
-            "joint_10": 0.6709, 
-            "joint_11": 0.3643,
-            "joint_12": 1.2536,
-            "joint_13": 0.5940,
-            "joint_14": -0.1373,
-            "joint_15": 0.5759,
+            "joint_0": 0.011,
+            "joint_1": 1.216, 
+            "joint_2": 0.082, 
+            "joint_3": 0.615,
+            "joint_4": 0.029,
+            "joint_5": 1.018,
+            "joint_6": 0.073,
+            "joint_7": 0.696,
+            "joint_8": 0.149,
+            "joint_9": 1.095, 
+            "joint_10": 0.835, 
+            "joint_11": 0.230,
+            "joint_12": 1.339,
+            "joint_13": 0.467,
+            "joint_14": 0.915,
+            "joint_15": -0.263,
         }
         # # update the base initial joint.
         # self.hand_qpos_init_override.update({
@@ -524,7 +550,7 @@ class AllegroHandDown(VecTask):
         object_start_pose.r = gymapi.Quat.from_euler_zyx(np.pi/2, 0.0, 0.0) 
 
         shadow_hand_start_pose = gymapi.Transform()
-        shadow_hand_start_pose.p = gymapi.Vec3(-0.08, 0.0, self.table_height + 0.14)
+        shadow_hand_start_pose.p = gymapi.Vec3(-0.08, 0.0, self.table_height + 0.145)
         shadow_hand_start_pose.r = gymapi.Quat.from_euler_zyx(0.0, np.pi/2, 0.0)  # 手心朝 -Z
 
         self.goal_displacement = gymapi.Vec3(-0.2, -0.1, 0.12)
@@ -649,6 +675,13 @@ class AllegroHandDown(VecTask):
             if i == 0 and not self._printed_maps:
                 tip_env_ids = [self._table_rb_count + j for j in self.fingertip_actor_indices]
                 print(f"[FINGERTIP] actor_ids={self.fingertip_actor_indices} -> env_ids={tip_env_ids}")
+
+        env0, hand0 = self.envs[0], self.allegro_hands[0]
+        self.palm_body_name = "palm_link"
+        palm_actor_id = self.gym.find_actor_rigid_body_handle(env0, hand0, self.palm_body_name)
+        if palm_actor_id < 0:
+            palm_actor_id = 0
+        self.palm_env_rb_index = self._table_rb_count + palm_actor_id  # env 级索引
 
 
         # ===== 结尾：转换为张量/缓存 =====
@@ -878,7 +911,22 @@ class AllegroHandDown(VecTask):
                     # 经验建议（仅文本提示，不会改配置）：
                     # 距离阈值：取 p70~p80 之间（可先用 p80≈(qd[1]+qd[2])/2）
                     # 力阈值：取 p60~p70 之间（可先用 0.5*(qf[0]+qf[1])）
-                    
+        
+        # 初始姿态在 _create_envs 里已存到 self.shadow_hand_default_dof_pos  [ndof]
+        q     = self.shadow_hand_dof_pos                                  # [N, ndof]
+        q0    = self.shadow_hand_default_dof_pos.unsqueeze(0)             # [1, ndof] 便于广播
+        pose_diff_penalty = ((q - q0) ** 2).sum(dim=1)                    # [N]
+        r_pose = - self.pose_penalty_scale * pose_diff_penalty            # [N]
+
+
+        if self.palm_z_alpha > 0.0:
+            palm_z_all = self.rigid_body_states[:, self.palm_env_rb_index, 2]        # [N]
+            dz_now = self.object_pos[:, 2] - palm_z_all                               # [N]
+            err = torch.abs(dz_now - self.palm_obj_dz0)                               # |dz - dz0|
+            r_palmz = - self.palm_z_alpha * torch.clamp(err - self.palm_z_tol, min=0.0)
+        else:
+            r_palmz = torch.zeros(self.num_envs, device=self.device)
+
         # —— 用 JIT 奖励计算 —— 
         (rew, resets_base, theta_out, succ_hold_out,
          theta_step, dev_angle, r_rot, r_push, r_table, r_fall,
@@ -912,7 +960,7 @@ class AllegroHandDown(VecTask):
         resets = torch.where(timed_out, torch.ones_like(resets_base), resets_base)
 
         # 写回 buffer
-        self.rew_buf[:]   = rew + r_fc + r_contact_hold
+        self.rew_buf[:]   = rew + r_fc + r_contact_hold + r_pose + r_palmz
         self.reset_buf[:] = resets.float()
 
         # 维护状态
@@ -934,6 +982,10 @@ class AllegroHandDown(VecTask):
         self.extras["r_tb"]     = r_tb.mean()
         self.extras["r_knear"]  = r_knear.mean()
         
+        self.extras["r_pose"]   = r_pose.mean()
+        self.extras["r_palmz"] = r_palmz.mean()
+        self.extras["dz_now"]  = dz_now.mean() if self.palm_z_alpha>0 else torch.tensor(0.0, device=self.device)
+
         # 统计（可保留你原有的）
         self.extras["fc_gc2"]       = gc2_n.mean() if self.fc_normalize else gc2.mean()
         self.extras["fc_lamneg"]    = lam_n.mean() if self.fc_normalize else lam_neg.mean()
@@ -1199,6 +1251,9 @@ class AllegroHandDown(VecTask):
         self.last_object_rot[env_ids] = self.root_state_tensor[self.object_indices[env_ids], 3:7]
         self.succ_hold_count[env_ids] = 0.0
 
+        palm_z = self.rigid_body_states[env_ids, self.palm_env_rb_index, 2]          # [B]
+        obj_z  = self.root_state_tensor[self.object_indices[env_ids], 2]             # [B]
+        self.palm_obj_dz0[env_ids] = obj_z - palm_z
         # print("after reset q[0]:", self.shadow_hand_dof_pos[env_ids[0], :].tolist())
 
 
@@ -1391,11 +1446,15 @@ def compute_spin_reward_axis_jit(
     # 计算每步“近接触”的指尖数
     d_tip = torch.norm(tip_pos - obj_pos[:, None, :], dim=-1)       # [N, tip]
     knear = (d_tip < near_thr).sum(dim=1)                           # [N]
-    in_air = (obj_pos[:, 2] > (z_min))
-    gate = ( (knear >= 3) & in_air ).float()                        # [N]
+    in_air = (obj_pos[:, 2] > (z_min+0.001))
+    gate = ( (knear >= 4) & in_air ).float()          # TODO knear close to 4   # [N]
     # r_rot 只在 gate=1 时吃满；否则打 0.3 折扣（仍可探索）
-    r_rot = r_rot * (0.3 + 0.7 * gate)
-    r_knear = 0.15 * (knear >= 3).float() + 0.15 * (knear >= 4).float()
+    # TODO DEBUG for the rotation
+    # r_rot = r_rot * (0.3 + 0.7 * gate)
+    r_knear = 0.15 * (knear >= 3).float() + 0.3 * (knear >= 4).float()
+    
+    # TODO DEBUG for the rotation 
+    r_knear = 0.0 * r_knear
 
     # 目标角/成功维持
     if use_theta_goal == 1:
@@ -1460,19 +1519,30 @@ def compute_spin_reward_axis_jit(
     # 非指尖用力占位
     r_pen = torch.zeros_like(theta_buf)
 
+    r_succ = w_succ * r_succ
+    r_rot  = w_rot  * r_rot
+    r_err  = w_err  * r_err
+    r_push = w_push * r_push
+    r_table = w_table * r_table
+    r_fall = w_fall * r_fall 
+    r_work = w_work * r_work
+    r_torque = w_torque * r_torque
+    r_pen  = w_pen  * r_pen
+    r_dev  = w_dev  * r_dev
+
+
     # —— 汇总（注意：r_ftip / r_energy / r_tb 均已带系数）——
     rew = (
-        w_succ   * r_succ   +
-        w_rot    * r_rot    +
-        w_err    * r_err    +
-        # w_dist   * r_dist   +
-        w_push   * r_push   +
-        w_table  * r_table  +
-        w_fall   * r_fall   +
-        w_work   * r_work   +   # 若改用 r_energy，可把 w_work 设 0
-        w_torque * r_torque +
-        w_pen    * r_pen    +
-        w_dev    * r_dev    +
+        r_succ   +
+        r_rot    +
+        r_err    +
+        r_push   +
+        r_table  +
+        r_fall   +
+        r_work   +   # 若改用 r_energy，可把 w_work 设 0
+        r_torque +
+        r_pen    +
+        r_dev    +
         r_ftip + r_energy + r_tb + r_knear
     )
 
